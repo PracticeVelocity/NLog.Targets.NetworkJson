@@ -1,5 +1,7 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Configuration;
+using System.IO;
 using GDNetworkJSONService.Helpers;
 using GDNetworkJSONService.LocalLogStorageDB;
 using NLog.Targets.NetworkJSON.ExtensionMethods;
@@ -24,16 +26,17 @@ namespace GDNetworkJSONService.Models
                         @"and provides the 'store and forward' capability of the NLog.Targets.NetworkJSON",
                         @"NLog Target.",
                         @" ",
-                        $"{AppBinaryName} /CONSOLE [/ENDPOINT=http://localhost:portnumber] [/DBSELECTCOUNT=X]",
-                        $"     [/MTDL=X]",
+                        $"{AppBinaryName} /CONSOLE /GDDBSPATH='C:\\somewhere' [/DBSELECTCOUNT=X]",
+                        @"     [/MULTIWRITEPAUSE=X] [/MTDL=X]",
                         @" ",
                         @"  /CONSOLE                  Run this app in console mode, if this is NOT SET then",
                         @"                            the application will attempt to start as a service.",
-                        @"  /ENDPOINT                 The optional endpoint to use as the listener for client",
-                        @"                            programs. If not set then the default is retrieved from",
-                        @"                            the application configuration file.",
+                        @"  /GDDBSPATH                The location where Guaranteed Delivery DBs will reside.",
                         @"  /DBSELECTCOUNT            The number of log messages to read from the Log Storage DB",
-                        $"                            in a single SELECT statement.",
+                        @"                            in a single SELECT statement.",
+                        @"  /MULTIWRITEPAUSE          The number of milliseconds to wait before attempting to process",
+                        @"                            more messages with a multiwrite target if the logging database",
+                        @"                            does not return DBSELECTCOUNT messages.",
                         @"  /MTDL                     The number of minutes on SUBSEQUENT retries of attempting to",
                         @"                            send a log message before it is considered a 'Dead Letter'",
                         $"                            and is moved to the {DeadLetterLogStorageTable.TableName} table.",
@@ -76,25 +79,21 @@ namespace GDNetworkJSONService.Models
                     ProcessOptionalCommandLineEntry(arg);
                 }
             }
-            if (Endpoint.IsNullOrEmpty())
+            if (GdDbsPath.IsNullOrEmpty())
             {
-                Endpoint = ConfigurationManager.AppSettings["Endpoint"];
-                if (Endpoint.IsNullOrEmpty())
+                GdDbsPath = ConfigurationManager.AppSettings["GdDbsPath"];
+                if (GdDbsPath.IsNullOrEmpty())
                 {
-                    ErrorInfo.Add("Endpoint is not properly setup in the application configuration and was not passed at the command line.");
-                }
-            }
-            if (LocalLogStorage.IsNullOrEmpty())
-            {
-                LocalLogStorage = ConfigurationManager.ConnectionStrings["LocalLogStorage"]?.ConnectionString;
-                if (LocalLogStorage.IsNullOrEmpty())
-                {
-                    ErrorInfo.Add("LocalLogStorage is not properly setup in the application configuration and was not passed at the command line.");
+                    ErrorInfo.Add("Guaranteed Delivery DBs Path is not properly setup in the application configuration and was not passed at the command line.");
                 }
             }
             if (DbSelectCount < 1)
             {
                 DbSelectCount = AppSettingsHelper.DbSelectCount;
+            }
+            if (MultiWritePause < 1)
+            {
+                MultiWritePause = AppSettingsHelper.MultiWritePause;
             }
             if (MinutesToDeadLetter < 1)
             {
@@ -111,14 +110,6 @@ namespace GDNetworkJSONService.Models
 
         private void ProcessOptionalCommandLineEntry(string commandLineEntry)
         {
-            if (commandLineEntry.StartsWithCommandLineArg("endpoint"))
-            {
-                var arg = commandLineEntry.Split('=');
-                if (arg.Length == 2)
-                {
-                    Endpoint = arg[1];
-                }
-            }
             if (commandLineEntry.StartsWithCommandLineArg("dbselectcount"))
             {
                 var arg = commandLineEntry.Split('=');
@@ -133,7 +124,21 @@ namespace GDNetworkJSONService.Models
                     ErrorInfo.Add("Invalid DBSELECTCOUNT parameter");
                 }
             }
-            if (commandLineEntry.StartsWithCommandLineArg("mtdl"))
+            else if (commandLineEntry.StartsWithCommandLineArg("multiwritepause"))
+            {
+                var arg = commandLineEntry.Split('=');
+                var multiWritePause = -1;
+
+                if ((arg.Length == 2) && int.TryParse(arg[1], out multiWritePause) && multiWritePause > 0)
+                {
+                    MultiWritePause = multiWritePause;
+                }
+                else
+                {
+                    ErrorInfo.Add("Invalid MULTIWRITEPAUSE parameter");
+                }
+            }
+            else if (commandLineEntry.StartsWithCommandLineArg("mtdl"))
             {
                 var arg = commandLineEntry.Split('=');
                 var mtdl = -1;
@@ -146,6 +151,11 @@ namespace GDNetworkJSONService.Models
                 {
                     ErrorInfo.Add("Invalid MTDL parameter");
                 }
+            }
+            else if (commandLineEntry.StartsWithCommandLineArg("gddbspath"))
+            {
+                var arg = commandLineEntry.Split('=');
+                GdDbsPath = arg[1];
             }
         }
 
@@ -169,43 +179,39 @@ namespace GDNetworkJSONService.Models
                 ParameterInfo.Add($"Console Mode = {_consoleMode}");
             }
         }
-
-        private string _endpoint;
-        public string Endpoint
+        
+        public string GdDbsPath
         {
             get
             {
-                return _endpoint;
-            }
-            set
-            {
-                _endpoint = value;
-                ParameterInfo.Add($"Service Endpoint = {_endpoint}");
-            }
-        }
-
-        public string LocalLogStorage
-        {
-            get
-            {
-                return LogStorageDbGlobals.ConnectionString;
+                return LogStorageDbGlobals.GdDbsPath;
             }
             set
             {
                 if (value.IsNullOrEmpty())
                 {
-                    LogStorageDbGlobals.ConnectionString = "";
+                    LogStorageDbGlobals.GdDbsPath = "";
                     return;
                 }
-                if(value.Length > 3 && (value.StartsWith("\"") || value.StartsWith("'")))
+                
+                try
                 {
-                    LogStorageDbGlobals.ConnectionString = value.Substring(0, value.Length - 2);
+                    if (value.Length > 3 && (value.StartsWith("\"") || value.StartsWith("'")))
+                    {
+                        LogStorageDbGlobals.GdDbsPath = value.Substring(0, value.Length - 2);
+                    }
+                    else
+                    {
+                        LogStorageDbGlobals.GdDbsPath = value;
+                    }
+
+                    if (!Directory.Exists(value)) Directory.CreateDirectory(value);
+                    ParameterInfo.Add($"Guaranteed Delivery DBs Path = {LogStorageDbGlobals.GdDbsPath}");
                 }
-                else
+                catch
                 {
-                    LogStorageDbGlobals.ConnectionString = value;
+                    throw new Exception($"GdDbsPath '{value}' could not be created.");
                 }
-                ParameterInfo.Add($"Log Log Storage Connection String = {LogStorageDbGlobals.ConnectionString}");
             }
         }
 
@@ -222,7 +228,24 @@ namespace GDNetworkJSONService.Models
                     return;
                 }
                 LogStorageDbGlobals.DbSelectCount = value;
-                ParameterInfo.Add($"DB Read Count = {LogStorageDbGlobals.DbSelectCount}");
+                ParameterInfo.Add($"DB Select Count = {LogStorageDbGlobals.DbSelectCount}");
+            }
+        }
+
+        public int MultiWritePause
+        {
+            get
+            {
+                return LogStorageDbGlobals.MultiWritePause;
+            }
+            set
+            {
+                if (value < 1)
+                {
+                    return;
+                }
+                LogStorageDbGlobals.MultiWritePause = value;
+                ParameterInfo.Add($"MultiWrite Pause (MS) = {LogStorageDbGlobals.MultiWritePause}");
             }
         }
 
